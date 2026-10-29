@@ -4,7 +4,7 @@ import sys
 import json
 from typing import Any, cast
 from openai import OpenAI
-from .utils import get_tools, read_file, write_file
+from .utils import bash, get_tools, read_file, write_file
 
 API_KEY = os.getenv("OPENROUTER_API_KEY")
 BASE_URL = os.getenv("OPENROUTER_BASE_URL", default="https://openrouter.ai/api/v1")
@@ -51,6 +51,8 @@ def main():
                 tool = read_file
             elif tool_name == "Write":
                 tool = write_file
+            elif tool_name == "Bash":
+                tool = bash
             else:
                 raise RuntimeError(f"Unknown tool: {tool_name}")
             tool_args = getattr(tool_call.function, "arguments", None) or getattr(
