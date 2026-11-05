@@ -190,7 +190,10 @@ def main():
                 if isinstance(tool_args, (bytes, bytearray)):
                     tool_args = tool_args.decode()
                 tool_kwargs = json.loads(tool_args)
-            result = tool(**tool_kwargs)
+            try:
+                result = tool(**tool_kwargs)
+            except (IsADirectoryError, FileNotFoundError, PermissionError, OSError) as error:
+                result = f"Tool error: {error}"
             messages.append(
                 {"role": "tool", "tool_call_id": tool_call.id, "content": result}
             )
