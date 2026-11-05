@@ -11,18 +11,9 @@ API_KEY = os.getenv("OPENROUTER_API_KEY")
 BASE_URL = os.getenv("OPENROUTER_BASE_URL", default="https://openrouter.ai/api/v1")
 
 
-def load_invoked_skill(prompt: str) -> tuple[str, str, str, str] | None:
-    """Return the invoked skill's name, description, body, and raw arguments."""
-    if not prompt.startswith("/"):
-        return None
-
-    invocation = prompt[1:].split(maxsplit=1)
-    if not invocation:
-        return None
-    command = invocation[0]
-    arguments = invocation[1] if len(invocation) > 1 else ""
-
-    skill_path = os.path.join(".claude", "skills", command, "SKILL.md")
+def load_skill(skill_name: str) -> tuple[str, str, str] | None:
+    """Return a skill's name, description, and instruction body."""
+    skill_path = os.path.join(".claude", "skills", skill_name, "SKILL.md")
     if not os.path.isfile(skill_path):
         return None
 
@@ -45,7 +36,31 @@ def load_invoked_skill(prompt: str) -> tuple[str, str, str, str] | None:
         if separator and key.strip() == "description":
             description = value.strip().strip("\"'")
             break
-    return command, description, body, arguments
+    return skill_name, description, body
+
+
+def load_invoked_skills(prompt: str) -> tuple[list[str], str] | None:
+    """Load consecutive known skill commands and return their shared arguments."""
+    if not prompt.startswith("/"):
+        return None
+
+    tokens = prompt.split()
+    skill_names: list[str] = []
+    for token in tokens:
+        if not token.startswith("/") or len(token) == 1:
+            break
+        skill_name = token[1:]
+        if not os.path.isfile(
+            os.path.join(".claude", "skills", skill_name, "SKILL.md")
+        ):
+            break
+        skill_names.append(skill_name)
+
+    if not skill_names:
+        return None
+
+    arguments = " ".join(tokens[len(skill_names) :])
+    return skill_names, arguments
 
 
 def substitute_skill_arguments(body: str, arguments: str) -> str:
@@ -99,7 +114,7 @@ def main():
     client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
     tools = get_tools()
     available_skills = discover_skills()
-    invoked_skill = load_invoked_skill(args.p)
+    invocation = load_invoked_skills(args.p)
     skill_lines = "\n".join(
         f"- {skill_name}: {description}"
         for skill_name, description in available_skills
@@ -108,13 +123,18 @@ def main():
         "role": "system",
         "content": "You have access to the following skills:\n\n" + skill_lines,
     }
-    if invoked_skill:
-        _, _, skill_body, skill_arguments = invoked_skill
-        skill_body = substitute_skill_arguments(skill_body, skill_arguments)
+    if invocation:
+        skill_names, skill_arguments = invocation
         messages: list[Any] = [
             system_message,
-            {"role": "user", "content": skill_body},
         ]
+        for skill_name in skill_names:
+            skill = load_skill(skill_name)
+            if skill is None:
+                continue
+            _, _, skill_body = skill
+            skill_body = substitute_skill_arguments(skill_body, skill_arguments)
+            messages.append({"role": "user", "content": skill_body})
     else:
         messages = [system_message, {"role": "user", "content": args.p}]
 
