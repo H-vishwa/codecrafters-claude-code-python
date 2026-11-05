@@ -2,12 +2,47 @@ import argparse
 import os
 import sys
 import json
-from typing import Any, cast
+from typing import Any
 from openai import OpenAI
 from .utils import bash, get_tools, read_file, write_file
 
 API_KEY = os.getenv("OPENROUTER_API_KEY")
 BASE_URL = os.getenv("OPENROUTER_BASE_URL", default="https://openrouter.ai/api/v1")
+
+
+def load_invoked_skill(prompt: str) -> tuple[str, str, str] | None:
+    """Return the invoked skill's name, description, and body."""
+    if not prompt.startswith("/"):
+        return None
+
+    command = prompt[1:].split(maxsplit=1)[0] if prompt[1:].strip() else ""
+    if not command:
+        return None
+
+    skill_path = os.path.join(".claude", "skills", command, "SKILL.md")
+    if not os.path.isfile(skill_path):
+        return None
+
+    with open(skill_path, encoding="utf-8") as skill_file:
+        content = skill_file.read()
+
+    # Skill files start with YAML frontmatter. The body begins after its closing
+    # delimiter; split only twice so delimiters inside the body are preserved.
+    parts = content.split("---", 2)
+    if len(parts) == 3 and parts[0].strip() == "":
+        frontmatter = parts[1]
+        body = parts[2].strip()
+    else:
+        frontmatter = ""
+        body = content.strip()
+
+    description = ""
+    for line in frontmatter.splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip() == "description":
+            description = value.strip().strip("\"'")
+            break
+    return command, description, body
 
 
 def main():
@@ -20,7 +55,19 @@ def main():
 
     client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
     tools = get_tools()
-    messages: list[Any] = [{"role": "user", "content": args.p}]
+    invoked_skill = load_invoked_skill(args.p)
+    if invoked_skill:
+        skill_name, skill_description, skill_body = invoked_skill
+        skill_listing = f"- {skill_name}: {skill_description}"
+        messages: list[Any] = [
+            {
+                "role": "system",
+                "content": f"You have access to the following skills:\n\n{skill_listing}",
+            },
+            {"role": "user", "content": skill_body},
+        ]
+    else:
+        messages = [{"role": "user", "content": args.p}]
 
     model = "anthropic/claude-haiku-4.5"
 
