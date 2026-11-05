@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import sys
 import json
 from typing import Any
@@ -10,14 +11,16 @@ API_KEY = os.getenv("OPENROUTER_API_KEY")
 BASE_URL = os.getenv("OPENROUTER_BASE_URL", default="https://openrouter.ai/api/v1")
 
 
-def load_invoked_skill(prompt: str) -> tuple[str, str, str] | None:
-    """Return the invoked skill's name, description, and body."""
+def load_invoked_skill(prompt: str) -> tuple[str, str, str, str] | None:
+    """Return the invoked skill's name, description, body, and raw arguments."""
     if not prompt.startswith("/"):
         return None
 
-    command = prompt[1:].split(maxsplit=1)[0] if prompt[1:].strip() else ""
-    if not command:
+    invocation = prompt[1:].split(maxsplit=1)
+    if not invocation:
         return None
+    command = invocation[0]
+    arguments = invocation[1] if len(invocation) > 1 else ""
 
     skill_path = os.path.join(".claude", "skills", command, "SKILL.md")
     if not os.path.isfile(skill_path):
@@ -42,7 +45,19 @@ def load_invoked_skill(prompt: str) -> tuple[str, str, str] | None:
         if separator and key.strip() == "description":
             description = value.strip().strip("\"'")
             break
-    return command, description, body
+    return command, description, body, arguments
+
+
+def substitute_skill_arguments(body: str, arguments: str) -> str:
+    """Substitute full and positional skill argument placeholders."""
+    argument_list = arguments.split()
+    body = body.replace("$ARGUMENTS", arguments)
+
+    def replace_positional(match: re.Match[str]) -> str:
+        index = int(match.group(1) or match.group(2))
+        return argument_list[index] if index < len(argument_list) else ""
+
+    return re.sub(r"\$ARGUMENTS\[(\d+)\]|\$(\d+)\b", replace_positional, body)
 
 
 def discover_skills() -> list[tuple[str, str]]:
@@ -94,7 +109,8 @@ def main():
         "content": "You have access to the following skills:\n\n" + skill_lines,
     }
     if invoked_skill:
-        _, _, skill_body = invoked_skill
+        _, _, skill_body, skill_arguments = invoked_skill
+        skill_body = substitute_skill_arguments(skill_body, skill_arguments)
         messages: list[Any] = [
             system_message,
             {"role": "user", "content": skill_body},
