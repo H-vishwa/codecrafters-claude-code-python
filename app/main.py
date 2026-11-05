@@ -121,7 +121,16 @@ def main():
     )
     system_message = {
         "role": "system",
-        "content": "You have access to the following skills:\n\n" + skill_lines,
+        "content": (
+            "You have access to the following skills:\n\n"
+            + skill_lines
+            + (
+                "\n\nIf a skill matches the user's request, call the Skill tool "
+                "with its name and follow the instructions it returns."
+                if available_skills
+                else ""
+            )
+        ),
     }
     if invocation:
         skill_names, skill_arguments = invocation
@@ -171,29 +180,65 @@ def main():
             tool_name = getattr(tool_call.function, "name", None) or getattr(
                 tool_call, "name", None
             )
-            if tool_name == "Read":
+            if tool_name == "Skill":
+                tool_args = getattr(tool_call.function, "arguments", None) or getattr(
+                    tool_call, "arguments", None
+                )
+                if tool_args is None:
+                    tool_kwargs = {}
+                else:
+                    if isinstance(tool_args, (bytes, bytearray)):
+                        tool_args = tool_args.decode()
+                    tool_kwargs = json.loads(tool_args)
+                requested_name = tool_kwargs.get("name", "")
+                if requested_name not in {name for name, _ in available_skills}:
+                    result = f"Unknown skill: {requested_name}"
+                else:
+                    skill = load_skill(requested_name)
+                    if skill is None:
+                        result = f"Unknown skill: {requested_name}"
+                    else:
+                        _, _, skill_body = skill
+                        skill_arguments = tool_kwargs.get("args", "")
+                        skill_body = substitute_skill_arguments(
+                            skill_body, skill_arguments
+                        )
+                        skill_folder = os.path.join(
+                            ".claude", "skills", requested_name
+                        ).replace(os.sep, "/")
+                        result = (
+                            f"Skill: {requested_name} (located at {skill_folder})\n"
+                            "Paths in the instructions below are relative to that folder.\n\n"
+                            f"{skill_body}"
+                        )
+            elif tool_name == "Read":
                 tool = read_file
             elif tool_name == "Write":
                 tool = write_file
             elif tool_name == "Bash":
                 tool = bash
-            else:
+            elif tool_name not in ("Skill",):
                 raise RuntimeError(f"Unknown tool: {tool_name}")
-            tool_args = getattr(tool_call.function, "arguments", None) or getattr(
-                tool_call, "arguments", None
-            )
-            # tool_args may be None or not a str; ensure we pass a str to json.loads
-            if tool_args is None:
-                tool_kwargs = {}
-            else:
-                # some runtimes may provide arguments as bytes; decode if needed
-                if isinstance(tool_args, (bytes, bytearray)):
-                    tool_args = tool_args.decode()
-                tool_kwargs = json.loads(tool_args)
-            try:
-                result = tool(**tool_kwargs)
-            except (IsADirectoryError, FileNotFoundError, PermissionError, OSError) as error:
-                result = f"Tool error: {error}"
+            if tool_name != "Skill":
+                tool_args = getattr(tool_call.function, "arguments", None) or getattr(
+                    tool_call, "arguments", None
+                )
+                # tool_args may be None or not a str; ensure we pass a str to json.loads
+                if tool_args is None:
+                    tool_kwargs = {}
+                else:
+                    if isinstance(tool_args, (bytes, bytearray)):
+                        tool_args = tool_args.decode()
+                    tool_kwargs = json.loads(tool_args)
+                try:
+                    result = tool(**tool_kwargs)
+                except (
+                    IsADirectoryError,
+                    FileNotFoundError,
+                    PermissionError,
+                    OSError,
+                ) as error:
+                    result = f"Tool error: {error}"
             messages.append(
                 {"role": "tool", "tool_call_id": tool_call.id, "content": result}
             )
