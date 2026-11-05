@@ -45,6 +45,34 @@ def load_invoked_skill(prompt: str) -> tuple[str, str, str] | None:
     return command, description, body
 
 
+def discover_skills() -> list[tuple[str, str]]:
+    """Read skill names and descriptions without loading their instruction bodies."""
+    skills_dir = os.path.join(".claude", "skills")
+    if not os.path.isdir(skills_dir):
+        return []
+
+    skills: list[tuple[str, str]] = []
+    for skill_name in sorted(os.listdir(skills_dir)):
+        skill_path = os.path.join(skills_dir, skill_name, "SKILL.md")
+        if not os.path.isfile(skill_path):
+            continue
+
+        with open(skill_path, encoding="utf-8") as skill_file:
+            content = skill_file.read()
+        parts = content.split("---", 2)
+        if len(parts) != 3 or parts[0].strip():
+            continue
+
+        description = ""
+        for line in parts[1].splitlines():
+            key, separator, value = line.partition(":")
+            if separator and key.strip() == "description":
+                description = value.strip().strip("\"'")
+                break
+        skills.append((skill_name, description))
+    return skills
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("-p", required=True)
@@ -55,19 +83,24 @@ def main():
 
     client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
     tools = get_tools()
+    available_skills = discover_skills()
     invoked_skill = load_invoked_skill(args.p)
+    skill_lines = "\n".join(
+        f"- {skill_name}: {description}"
+        for skill_name, description in available_skills
+    )
+    system_message = {
+        "role": "system",
+        "content": "You have access to the following skills:\n\n" + skill_lines,
+    }
     if invoked_skill:
-        skill_name, skill_description, skill_body = invoked_skill
-        skill_listing = f"- {skill_name}: {skill_description}"
+        _, _, skill_body = invoked_skill
         messages: list[Any] = [
-            {
-                "role": "system",
-                "content": f"You have access to the following skills:\n\n{skill_listing}",
-            },
+            system_message,
             {"role": "user", "content": skill_body},
         ]
     else:
-        messages = [{"role": "user", "content": args.p}]
+        messages = [system_message, {"role": "user", "content": args.p}]
 
     model = "anthropic/claude-haiku-4.5"
 
