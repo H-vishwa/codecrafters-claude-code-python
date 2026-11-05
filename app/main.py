@@ -134,7 +134,15 @@ def main():
                 continue
             _, _, skill_body = skill
             skill_body = substitute_skill_arguments(skill_body, skill_arguments)
-            messages.append({"role": "user", "content": skill_body})
+            skill_folder = os.path.join(".claude", "skills", skill_name).replace(
+                os.sep, "/"
+            )
+            skill_instructions = (
+                f"Skill: {skill_name} (located at {skill_folder})\n"
+                "Paths in the instructions below are relative to that folder.\n\n"
+                f"{skill_body}"
+            )
+            messages.append({"role": "user", "content": skill_instructions})
     else:
         messages = [system_message, {"role": "user", "content": args.p}]
 
