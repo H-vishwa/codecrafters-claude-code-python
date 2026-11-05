@@ -3,6 +3,7 @@ import os
 import re
 import sys
 import json
+import subprocess
 from typing import Any
 from openai import OpenAI
 from .utils import bash, get_tools, read_file, write_file
@@ -11,8 +12,8 @@ API_KEY = os.getenv("OPENROUTER_API_KEY")
 BASE_URL = os.getenv("OPENROUTER_BASE_URL", default="https://openrouter.ai/api/v1")
 
 
-def load_skill(skill_name: str) -> tuple[str, str, str] | None:
-    """Return a skill's name, description, and instruction body."""
+def load_skill(skill_name: str) -> tuple[str, str, str, str] | None:
+    """Return a skill's name, description, context, and instruction body."""
     skill_path = os.path.join(".claude", "skills", skill_name, "SKILL.md")
     if not os.path.isfile(skill_path):
         return None
@@ -31,12 +32,17 @@ def load_skill(skill_name: str) -> tuple[str, str, str] | None:
         body = content.strip()
 
     description = ""
+    context = ""
     for line in frontmatter.splitlines():
         key, separator, value = line.partition(":")
-        if separator and key.strip() == "description":
-            description = value.strip().strip("\"'")
-            break
-    return skill_name, description, body
+        if not separator:
+            continue
+        value = value.strip().strip("\"'")
+        if key.strip() == "description":
+            description = value
+        elif key.strip() == "context":
+            context = value
+    return skill_name, description, context, body
 
 
 def load_invoked_skills(prompt: str) -> tuple[list[str], str] | None:
@@ -103,6 +109,109 @@ def discover_skills() -> list[tuple[str, str]]:
     return skills
 
 
+def run_agent(
+    client: OpenAI,
+    model: str,
+    tools: list,
+    messages: list[Any],
+    available_skills: list[tuple[str, str]],
+) -> str:
+    """Run an agent conversation and return its final response."""
+    skill_names = {name for name, _ in available_skills}
+    while True:
+        chat = client.chat.completions.create(
+            model=model, messages=messages, max_tokens=1000, tools=tools
+        )
+
+        if not chat.choices:
+            raise RuntimeError("no choices in response")
+
+        message = chat.choices[0].message
+        if not message.tool_calls:
+            return message.content or ""
+
+        messages.append(
+            {"role": "assistant", "content": None, "tool_calls": message.tool_calls}
+        )
+
+        for tool_call in message.tool_calls:
+            tool_name = getattr(tool_call.function, "name", None) or getattr(
+                tool_call, "name", None
+            )
+            tool_args = getattr(tool_call.function, "arguments", None) or getattr(
+                tool_call, "arguments", None
+            )
+            if tool_args is None:
+                tool_kwargs = {}
+            else:
+                if isinstance(tool_args, (bytes, bytearray)):
+                    tool_args = tool_args.decode()
+                tool_kwargs = json.loads(tool_args)
+
+            if tool_name == "Skill":
+                requested_name = tool_kwargs.get("name", "")
+                if requested_name not in skill_names:
+                    result = f"Unknown skill: {requested_name}"
+                else:
+                    skill = load_skill(requested_name)
+                    if skill is None:
+                        result = f"Unknown skill: {requested_name}"
+                    else:
+                        _, _, context, skill_body = skill
+                        skill_arguments = tool_kwargs.get("args", "")
+                        skill_body = substitute_skill_arguments(
+                            skill_body, skill_arguments
+                        )
+                        skill_folder = os.path.join(
+                            ".claude", "skills", requested_name
+                        ).replace(os.sep, "/")
+                        skill_instructions = (
+                            f"Skill: {requested_name} (located at {skill_folder})\n"
+                            "Paths in the instructions below are relative to that folder.\n\n"
+                            f"{skill_body}"
+                        )
+                        if context == "fork":
+                            subagent_messages = [
+                                {"role": "user", "content": skill_instructions}
+                            ]
+                            subagent_answer = run_agent(
+                                client,
+                                model,
+                                tools,
+                                subagent_messages,
+                                available_skills,
+                            )
+                            result = (
+                                f"Skill {requested_name} ran in a separate context "
+                                f"and returned: {subagent_answer}"
+                            )
+                        else:
+                            result = skill_instructions
+            elif tool_name == "Read":
+                tool = read_file
+                try:
+                    result = tool(**tool_kwargs)
+                except (IsADirectoryError, FileNotFoundError, PermissionError, OSError) as error:
+                    result = f"Tool error: {error}"
+            elif tool_name == "Write":
+                tool = write_file
+                try:
+                    result = tool(**tool_kwargs)
+                except (IsADirectoryError, FileNotFoundError, PermissionError, OSError) as error:
+                    result = f"Tool error: {error}"
+            elif tool_name == "Bash":
+                try:
+                    result = bash(**tool_kwargs)
+                except (OSError, subprocess.SubprocessError) as error:
+                    result = f"Tool error: {error}"
+            else:
+                raise RuntimeError(f"Unknown tool: {tool_name}")
+
+            messages.append(
+                {"role": "tool", "tool_call_id": tool_call.id, "content": result}
+            )
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("-p", required=True)
@@ -141,7 +250,7 @@ def main():
             skill = load_skill(skill_name)
             if skill is None:
                 continue
-            _, _, skill_body = skill
+            _, _, _, skill_body = skill
             skill_body = substitute_skill_arguments(skill_body, skill_arguments)
             skill_folder = os.path.join(".claude", "skills", skill_name).replace(
                 os.sep, "/"
@@ -157,91 +266,8 @@ def main():
 
     model = "anthropic/claude-haiku-4.5"
 
-    while True:
-        chat = client.chat.completions.create(
-            model=model, messages=messages, max_tokens=1000, tools=tools
-        )
-
-        if not chat.choices or len(chat.choices) == 0:
-            raise RuntimeError("no choices in response")
-
-        message = chat.choices[0].message
-
-        messages.append(
-            {"role": "assistant", "content": None, "tool_calls": message.tool_calls}
-        )
-
-        if not message.tool_calls:
-            print(message.content)
-            break
-
-        for tool_call in message.tool_calls:
-            # some runtime types expose the tool name under different attributes; be defensive.
-            tool_name = getattr(tool_call.function, "name", None) or getattr(
-                tool_call, "name", None
-            )
-            if tool_name == "Skill":
-                tool_args = getattr(tool_call.function, "arguments", None) or getattr(
-                    tool_call, "arguments", None
-                )
-                if tool_args is None:
-                    tool_kwargs = {}
-                else:
-                    if isinstance(tool_args, (bytes, bytearray)):
-                        tool_args = tool_args.decode()
-                    tool_kwargs = json.loads(tool_args)
-                requested_name = tool_kwargs.get("name", "")
-                if requested_name not in {name for name, _ in available_skills}:
-                    result = f"Unknown skill: {requested_name}"
-                else:
-                    skill = load_skill(requested_name)
-                    if skill is None:
-                        result = f"Unknown skill: {requested_name}"
-                    else:
-                        _, _, skill_body = skill
-                        skill_arguments = tool_kwargs.get("args", "")
-                        skill_body = substitute_skill_arguments(
-                            skill_body, skill_arguments
-                        )
-                        skill_folder = os.path.join(
-                            ".claude", "skills", requested_name
-                        ).replace(os.sep, "/")
-                        result = (
-                            f"Skill: {requested_name} (located at {skill_folder})\n"
-                            "Paths in the instructions below are relative to that folder.\n\n"
-                            f"{skill_body}"
-                        )
-            elif tool_name == "Read":
-                tool = read_file
-            elif tool_name == "Write":
-                tool = write_file
-            elif tool_name == "Bash":
-                tool = bash
-            elif tool_name not in ("Skill",):
-                raise RuntimeError(f"Unknown tool: {tool_name}")
-            if tool_name != "Skill":
-                tool_args = getattr(tool_call.function, "arguments", None) or getattr(
-                    tool_call, "arguments", None
-                )
-                # tool_args may be None or not a str; ensure we pass a str to json.loads
-                if tool_args is None:
-                    tool_kwargs = {}
-                else:
-                    if isinstance(tool_args, (bytes, bytearray)):
-                        tool_args = tool_args.decode()
-                    tool_kwargs = json.loads(tool_args)
-                try:
-                    result = tool(**tool_kwargs)
-                except (
-                    IsADirectoryError,
-                    FileNotFoundError,
-                    PermissionError,
-                    OSError,
-                ) as error:
-                    result = f"Tool error: {error}"
-            messages.append(
-                {"role": "tool", "tool_call_id": tool_call.id, "content": result}
-            )
+    response = run_agent(client, model, tools, messages, available_skills)
+    print(response)
 
 
 if __name__ == "__main__":
